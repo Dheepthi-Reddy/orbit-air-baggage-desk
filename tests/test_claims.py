@@ -1,5 +1,6 @@
 """Tests for branch feature/schema-and-filing (PLAN.md section 4.1)."""
 
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -261,3 +262,84 @@ def test_failed_history_write_rolls_back_status_change(conn):
 
     assert claims.get_claim(conn, claim_id)["status"] == "open"
     assert len(claims.get_history(conn, claim_id)) == history_before
+
+
+# --- feature/cli ---
+
+# Fixed --now values (no timezone, so the CLI treats them as UTC).
+CLI_FILED_AT = "2026-11-05T09:00:00"
+CLI_FIVE_HOURS_LATER = "2026-11-05T14:00:00"
+
+
+def run_cli(argv):
+    """Run main.main(argv) and return its exit code (argparse may raise SystemExit)."""
+    import main  # imported here so the earlier tests still run before main.py exists
+
+    try:
+        return main.main(argv)
+    except SystemExit as exc:
+        return exc.code
+
+
+def stored_claims(db_path):
+    connection = db.connect(str(db_path))
+    try:
+        return claims.list_claims(connection)
+    finally:
+        connection.close()
+
+
+def test_cli_seed_loads_csv(tmp_path):
+    db_path = tmp_path / "desk.db"
+    csv_path = tmp_path / "claims.csv"
+    csv_path.write_text(
+        "passenger,flight,type,tier,note\n"
+        "Ada Lovelace,OA100,lost,gold,Blue suitcase\n"
+        'Grace Hopper,OA200,delayed,silver,"Late, on next flight"\n'
+        "Alan Turing,OA300,damaged,standard,\n"
+    )
+
+    code = run_cli(["--db", str(db_path), "--now", CLI_FILED_AT, "seed", str(csv_path)])
+
+    assert code == 0
+    rows = stored_claims(db_path)
+    assert [(r["passenger"], r["flight"], r["claim_type"], r["tier"]) for r in rows] == [
+        ("Ada Lovelace", "OA100", "lost", "gold"),
+        ("Grace Hopper", "OA200", "delayed", "silver"),
+        ("Alan Turing", "OA300", "damaged", "standard"),
+    ]
+    assert rows[1]["note"] == "Late, on next flight"
+    assert all(r["status"] == "open" for r in rows)
+
+
+def test_cli_now_drives_escalate(tmp_path, capsys):
+    db_args = ["--db", str(tmp_path / "desk.db")]
+    filing = ["--passenger", "Ada", "--flight", "OA100", "--type", "lost"]
+    # A silver claim first (not overdue after 5h), so the gold claim's id isn't 1.
+    assert run_cli([*db_args, "--now", CLI_FILED_AT, "file", *filing, "--tier", "silver"]) == 0
+    assert run_cli([*db_args, "--now", CLI_FILED_AT, "file", *filing, "--tier", "gold"]) == 0
+    silver_id, gold_id = (r["id"] for r in stored_claims(tmp_path / "desk.db"))
+    capsys.readouterr()  # discard output from the file commands
+
+    code = run_cli([*db_args, "--now", CLI_FIVE_HOURS_LATER, "escalate"])
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert re.search(rf"\b{gold_id}\b", out), out
+    statuses = {r["id"]: r["status"] for r in stored_claims(tmp_path / "desk.db")}
+    assert statuses == {silver_id: "open", gold_id: "escalated"}
+
+
+def test_cli_unknown_tier_fails_with_error(tmp_path, capsys):
+    db_path = tmp_path / "desk.db"
+
+    code = run_cli([
+        "--db", str(db_path), "--now", CLI_FILED_AT,
+        "file", "--passenger", "Ada", "--flight", "OA100",
+        "--type", "lost", "--tier", "platinum",
+    ])
+
+    assert code != 0
+    assert re.search(r"tier|platinum", capsys.readouterr().err)
+    if db_path.exists():
+        assert stored_claims(db_path) == []
