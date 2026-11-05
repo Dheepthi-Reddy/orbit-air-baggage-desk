@@ -88,13 +88,19 @@ def _apply_change(conn, claim_id, new_status, changed_by, now, agent=None):
     _require_text("changed_by", changed_by)
     _require_datetime("now", now)
 
-    old_status = get_claim(conn, claim_id)["status"]  # raises if no such claim
+    claim = get_claim(conn, claim_id)  # raises if no such claim
+    old_status = claim["status"]
     allowed = ALLOWED_CHANGES[old_status]
     if new_status not in allowed:
         options = ", ".join(sorted(allowed)) or "nothing (final status)"
         raise ClaimError(
             f"claim {claim_id} cannot change from {old_status!r} to "
             f"{new_status!r}; from {old_status!r} it can go to: {options}"
+        )
+    if new_status == "escalated" and not is_overdue(claim, now):
+        raise ClaimError(
+            f"claim {claim_id} cannot be escalated: it is not overdue "
+            f"(deadline {claim['deadline']}, now {now.isoformat()})"
         )
 
     changed_at = now.isoformat()
@@ -130,6 +136,42 @@ def resolve_claim(conn, claim_id, changed_by, now):
 def close_claim(conn, claim_id, changed_by, now):
     """Close a resolved claim."""
     change_status(conn, claim_id, "closed", changed_by, now)
+
+
+def is_overdue(claim, now):
+    """True only when ``now`` is strictly later than the claim's deadline.
+
+    Exactly at the deadline is not overdue.
+    """
+    _require_datetime("now", now)
+    deadline = datetime.fromisoformat(claim["deadline"])
+    try:
+        return now > deadline
+    except TypeError:  # one has a timezone and the other doesn't
+        raise ClaimError(
+            f"cannot compare now {now.isoformat()} with deadline "
+            f"{claim['deadline']}: both need a timezone, or neither"
+        ) from None
+
+
+def escalate_overdue(conn, now, changed_by="system"):
+    """Escalate every overdue open or assigned claim. Returns their ids.
+
+    Each claim goes through the normal change path, so its status update and
+    history row are saved together in one transaction.
+    """
+    _require_datetime("now", now)
+    candidates = conn.execute(
+        "SELECT * FROM claims WHERE status IN (?, ?) ORDER BY id",
+        ("open", "assigned"),
+    ).fetchall()
+
+    escalated = []
+    for claim in candidates:
+        if is_overdue(claim, now):
+            _apply_change(conn, claim["id"], "escalated", changed_by, now)
+            escalated.append(claim["id"])
+    return escalated
 
 
 def get_claim(conn, claim_id):

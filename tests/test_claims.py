@@ -1,5 +1,6 @@
 """Tests for branch feature/schema-and-filing (PLAN.md section 4.1)."""
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -185,3 +186,78 @@ def test_change_adds_history_and_refused_change_leaves_everything(conn):
 
     assert dict(claims.get_claim(conn, claim_id)) == before
     assert len(claims.get_history(conn, claim_id)) == 2
+
+
+# --- feature/deadlines-and-escalation ---
+
+GOLD_DEADLINE = NOW + timedelta(hours=4)
+
+
+def test_deadline_by_tier(conn):
+    expected_hours = {"gold": 4, "silver": 24, "standard": 72}
+
+    for tier, hours in expected_hours.items():
+        claim_id = claims.file_claim(conn, "Ada", "OA100", "lost", tier, NOW)
+
+        deadline = as_datetime(claims.get_claim(conn, claim_id)["deadline"])
+        assert deadline == NOW + timedelta(hours=hours), f"{tier} should get {hours}h"
+
+
+@pytest.mark.parametrize(
+    ("check_time", "expected"),
+    [
+        pytest.param(GOLD_DEADLINE - timedelta(minutes=1), False, id="1-min-before"),
+        pytest.param(GOLD_DEADLINE, False, id="exactly-at"),
+        pytest.param(GOLD_DEADLINE + timedelta(minutes=1), True, id="1-min-after"),
+    ],
+)
+def test_is_overdue_at_gold_deadline_edge(conn, check_time, expected):
+    claim_id = claims.file_claim(conn, "Ada", "OA100", "lost", "gold", NOW)
+    claim = claims.get_claim(conn, claim_id)
+
+    assert claims.is_overdue(claim, check_time) is expected
+
+
+def test_escalate_overdue_escalates_only_overdue_open_and_assigned(conn):
+    check_time = NOW + timedelta(hours=5)  # past gold (4h), before silver (24h)
+
+    overdue_open = file_with_status(conn, "open")  # gold
+    overdue_assigned = file_with_status(conn, "assigned")  # gold
+    not_yet_overdue = claims.file_claim(conn, "Grace", "OA200", "delayed", "silver", NOW)
+    resolved = file_with_status(conn, "resolved")  # gold, past deadline
+    closed = file_with_status(conn, "closed")  # gold, past deadline
+
+    escalated_ids = claims.escalate_overdue(conn, check_time)
+
+    assert sorted(escalated_ids) == sorted([overdue_open, overdue_assigned])
+    for claim_id, old_status in [(overdue_open, "open"), (overdue_assigned, "assigned")]:
+        assert claims.get_claim(conn, claim_id)["status"] == "escalated"
+        entry = claims.get_history(conn, claim_id)[-1]
+        assert entry["old_status"] == old_status
+        assert entry["new_status"] == "escalated"
+        assert entry["changed_by"] == "system"
+        assert as_datetime(entry["changed_at"]) == check_time
+
+    for claim_id, status in [
+        (not_yet_overdue, "open"),
+        (resolved, "resolved"),
+        (closed, "closed"),
+    ]:
+        assert claims.get_claim(conn, claim_id)["status"] == status
+        assert len(claims.get_history(conn, claim_id)) == 1  # only the filing row
+
+
+def test_failed_history_write_rolls_back_status_change(conn):
+    claim_id = claims.file_claim(conn, "Ada", "OA100", "lost", "gold", NOW)
+    history_before = len(claims.get_history(conn, claim_id))
+    # Make every later history insert fail on purpose.
+    conn.execute(
+        "CREATE TRIGGER fail_history BEFORE INSERT ON history"
+        " BEGIN SELECT RAISE(ABORT, 'history write failed on purpose'); END"
+    )
+
+    with pytest.raises(sqlite3.DatabaseError, match="history write failed"):
+        claims.change_status(conn, claim_id, "assigned", "agent-ana", LATER)
+
+    assert claims.get_claim(conn, claim_id)["status"] == "open"
+    assert len(claims.get_history(conn, claim_id)) == history_before
