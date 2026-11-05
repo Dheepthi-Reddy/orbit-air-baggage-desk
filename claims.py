@@ -11,6 +11,15 @@ TIERS = ("gold", "silver", "standard")
 STATUSES = ("open", "assigned", "escalated", "resolved", "closed")
 DEADLINE_HOURS = {"gold": 4, "silver": 24, "standard": 72}
 
+# Allowed status changes (PLAN.md section 2): status -> statuses it may move to.
+ALLOWED_CHANGES = {
+    "open": {"assigned", "escalated"},
+    "assigned": {"resolved", "escalated"},
+    "escalated": {"assigned", "resolved"},
+    "resolved": {"closed"},
+    "closed": set(),
+}
+
 # Who is recorded in history when a claim is first filed.
 FILED_BY = "system"
 
@@ -56,13 +65,71 @@ def file_claim(conn, passenger, flight, claim_type, tier, now, note=None):
             (passenger, flight, claim_type, tier, note, filed_at, deadline),
         )
         claim_id = cursor.lastrowid
-        conn.execute(
-            "INSERT INTO history"
-            " (claim_id, old_status, new_status, changed_by, changed_at)"
-            " VALUES (?, NULL, 'open', ?, ?)",
-            (claim_id, FILED_BY, filed_at),
-        )
+        _write_history(conn, claim_id, None, "open", FILED_BY, filed_at)
     return claim_id
+
+
+def _write_history(conn, claim_id, old_status, new_status, changed_by, changed_at):
+    """Insert one history row. Callers run this inside their own transaction."""
+    conn.execute(
+        "INSERT INTO history"
+        " (claim_id, old_status, new_status, changed_by, changed_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (claim_id, old_status, new_status, changed_by, changed_at),
+    )
+
+
+def _apply_change(conn, claim_id, new_status, changed_by, now, agent=None):
+    """Check and apply one status change, plus its history row, atomically.
+
+    If ``agent`` is given it is saved on the claim in the same update.
+    """
+    _require_choice("status", new_status, STATUSES)
+    _require_text("changed_by", changed_by)
+    _require_datetime("now", now)
+
+    old_status = get_claim(conn, claim_id)["status"]  # raises if no such claim
+    allowed = ALLOWED_CHANGES[old_status]
+    if new_status not in allowed:
+        options = ", ".join(sorted(allowed)) or "nothing (final status)"
+        raise ClaimError(
+            f"claim {claim_id} cannot change from {old_status!r} to "
+            f"{new_status!r}; from {old_status!r} it can go to: {options}"
+        )
+
+    changed_at = now.isoformat()
+    with conn:  # one transaction: status update and history row together
+        if agent is None:
+            conn.execute(
+                "UPDATE claims SET status = ? WHERE id = ?", (new_status, claim_id)
+            )
+        else:
+            conn.execute(
+                "UPDATE claims SET status = ?, agent = ? WHERE id = ?",
+                (new_status, agent, claim_id),
+            )
+        _write_history(conn, claim_id, old_status, new_status, changed_by, changed_at)
+
+
+def change_status(conn, claim_id, new_status, changed_by, now):
+    """Move a claim to ``new_status`` if ALLOWED_CHANGES permits it."""
+    _apply_change(conn, claim_id, new_status, changed_by, now)
+
+
+def assign_claim(conn, claim_id, agent, now):
+    """Assign an open or escalated claim to ``agent``; the agent is recorded as who."""
+    _require_text("agent", agent)
+    _apply_change(conn, claim_id, "assigned", agent, now, agent=agent)
+
+
+def resolve_claim(conn, claim_id, changed_by, now):
+    """Resolve an assigned or escalated claim."""
+    change_status(conn, claim_id, "resolved", changed_by, now)
+
+
+def close_claim(conn, claim_id, changed_by, now):
+    """Close a resolved claim."""
+    change_status(conn, claim_id, "closed", changed_by, now)
 
 
 def get_claim(conn, claim_id):
