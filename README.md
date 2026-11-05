@@ -37,3 +37,19 @@ Claude Code responded:
 - **Prompt (code):** Implement them in claims.py, with every change built on `change_status`, the claim update and history row in one `with conn:` block, and the history code reused from `file_claim`.
 - **What the agent did (code):** Added `ALLOWED_CHANGES`, a single `_write_history` helper (now also used by `file_claim`) and `_apply_change`. That helper checks the claim exists and the change is allowed, then updates the claim and writes history in one transaction. `assign_claim` saves the agent in the same `UPDATE`. 13 passed, ruff clean.
 - **What I checked (code):** Because the tests don't call `resolve_claim` or `close_claim`, I had the full lifecycle run on an in-memory database. History came out as `(None → open, system)`, `(open → assigned, agent-ana)`, `(assigned → resolved, agent-ana)`, `(resolved → closed, supervisor-sam)`. I also noted that `change_status` currently allows `open → escalated` without checking the deadline. That check is planned for feature/deadlines-and-escalation.
+
+### feature/deadlines-and-escalation
+- **Prompt (tests):** Add exactly 6 tests for this branch: deadline = filed + 4/24/72h for each tier; a parametrized test at 1 minute before, exactly at, and 1 minute after the gold deadline; escalate_overdue escalates only overdue open/assigned claims and returns their ids; a rollback test where a trigger makes history inserts fail and the claim must stay unchanged. Don't touch claims.py or db.py.
+- **What the agent did (tests):** Added 6 tests (19 collected). 4 failed with `AttributeError` for the missing `is_overdue` and `escalate_overdue`; 15 passed.
+- **What I checked (tests):** Two new tests passed before any new code: the deadline-per-tier test (because `file_claim` already computes deadlines from branch 1) and the rollback test (because `change_status` already wraps the update and history insert in `with conn:` from branch 2). I confirmed both passed for that reason, not because the tests were wrong, before committing.
+- **Prompt (code):** Add `is_overdue` (strict `now > deadline`) and `escalate_overdue` using the same change path, and make `change_status` to `escalated` raise `ClaimError` unless the claim is overdue.
+- **What the agent did (code):** Implemented both functions and the overdue check on escalation. 19 passed, ruff clean.
+- **What I checked (code):** This closed the gap I noted on the previous branch, where `change_status` allowed escalating a claim that wasn't overdue. Confirmed `git diff tests/` was empty.
+
+### feature/cli
+- **Prompt (tests):** Add exactly 3 tests for the CLI: `main.main(argv)` returns an exit code, with global `--db` and `--now` (a `--now` without a timezone is treated as UTC). Test that seed loads a CSV, that `--now` drives escalate and prints the claim id, and that an unknown tier returns non-zero with an error. Don't touch any .py file except the test file.
+- **What the agent did (tests):** Added 3 tests (22 collected). All 3 failed because main.py didn't exist; the 19 earlier tests still passed.
+- **What I checked (tests):** Confirmed only tests/test_claims.py changed before committing, and committed the tests on their own before main.py.
+- **Prompt (code):** Create main.py with argparse so the tests pass, keeping all rules in claims.py. Only main.py may read the real clock, and only when `--now` isn't given. ClaimError goes to stderr with a non-zero exit.
+- **What the agent did (code):** Created main.py with all eight commands (file, list, assign, resolve, close, escalate, history, seed) and the global `--now` option. 22 passed, ruff clean.
+- **What I checked (code):** Ran `python main.py --db demo.db seed seed_claims.csv` and `list` myself to confirm the seed file loads without errors, and confirmed `git diff tests/` was empty after the code change.
