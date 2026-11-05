@@ -100,3 +100,88 @@ def test_list_claims_filters_by_status_and_tier(conn):
     assert ids(claims.list_claims(conn, tier="gold")) == {gold_open, gold_resolved}
     assert ids(claims.list_claims(conn, status="open", tier="gold")) == {gold_open}
     assert ids(claims.list_claims(conn, status="closed")) == set()
+
+
+# --- feature/assign-and-status ---
+
+# Allowed status changes, copied from PLAN.md section 2. Written out here so the
+# tests check claims.ALLOWED_CHANGES against the plan, not against itself.
+PLAN_ALLOWED_CHANGES = {
+    "open": {"assigned", "escalated"},
+    "assigned": {"resolved", "escalated"},
+    "escalated": {"assigned", "resolved"},
+    "resolved": {"closed"},
+    "closed": set(),
+}
+
+# A fixed time well past every tier's deadline (72h max) for status changes.
+LATER = NOW + timedelta(days=5)
+
+
+def file_with_status(conn, status):
+    """File a claim, then set its status directly (setup only)."""
+    claim_id = claims.file_claim(conn, "Ada", "OA100", "lost", "gold", NOW)
+    conn.execute("UPDATE claims SET status = ? WHERE id = ?", (status, claim_id))
+    return claim_id
+
+
+def test_assign_open_claim_sets_agent_and_status(conn):
+    claim_id = claims.file_claim(conn, "Ada", "OA100", "lost", "gold", NOW)
+
+    claims.assign_claim(conn, claim_id, "agent-ana", LATER)
+
+    claim = claims.get_claim(conn, claim_id)
+    assert claim["agent"] == "agent-ana"
+    assert claim["status"] == "assigned"
+
+
+def test_every_allowed_change_works(conn):
+    assert claims.ALLOWED_CHANGES == PLAN_ALLOWED_CHANGES
+
+    for old_status, new_statuses in PLAN_ALLOWED_CHANGES.items():
+        for new_status in new_statuses:
+            claim_id = file_with_status(conn, old_status)
+
+            claims.change_status(conn, claim_id, new_status, "agent-ana", LATER)
+
+            assert claims.get_claim(conn, claim_id)["status"] == new_status, (
+                f"{old_status} -> {new_status} should be allowed"
+            )
+
+
+@pytest.mark.parametrize(
+    ("old_status", "new_status"),
+    [
+        pytest.param("open", "closed", id="open-to-closed"),
+        pytest.param("resolved", "assigned", id="resolved-to-assigned"),
+        pytest.param("closed", "open", id="closed-to-open"),
+    ],
+)
+def test_disallowed_change_is_rejected(conn, old_status, new_status):
+    claim_id = file_with_status(conn, old_status)
+
+    with pytest.raises(claims.ClaimError, match=new_status):
+        claims.change_status(conn, claim_id, new_status, "agent-ana", LATER)
+
+    assert claims.get_claim(conn, claim_id)["status"] == old_status
+
+
+def test_change_adds_history_and_refused_change_leaves_everything(conn):
+    claim_id = claims.file_claim(conn, "Ada", "OA100", "lost", "gold", NOW)
+
+    claims.change_status(conn, claim_id, "assigned", "agent-ana", LATER)
+
+    history = claims.get_history(conn, claim_id)
+    assert len(history) == 2
+    entry = history[-1]
+    assert entry["old_status"] == "open"
+    assert entry["new_status"] == "assigned"
+    assert entry["changed_by"] == "agent-ana"
+    assert as_datetime(entry["changed_at"]) == LATER
+
+    before = dict(claims.get_claim(conn, claim_id))
+    with pytest.raises(claims.ClaimError):
+        claims.change_status(conn, claim_id, "closed", "agent-ana", LATER)
+
+    assert dict(claims.get_claim(conn, claim_id)) == before
+    assert len(claims.get_history(conn, claim_id)) == 2
