@@ -8,7 +8,9 @@ the real clock, and only when --now is not given.
 """
 
 import argparse
+import contextlib
 import csv
+import sqlite3
 import sys
 from datetime import UTC, datetime
 
@@ -73,11 +75,17 @@ def build_parser():
     return parser
 
 
+def printable(text):
+    """Replace newlines and control characters so free text stays on one line."""
+    return "".join(ch if ch.isprintable() else " " for ch in text)
+
+
 def format_claim(row):
     return (
         f"#{row['id']}  {row['status']:<9} {row['tier']:<8} {row['claim_type']:<7} "
-        f"{row['flight']:<7} {row['passenger']}  agent={row['agent'] or '-'}  "
-        f"deadline={row['deadline']}  note={row['note'] or '-'}"
+        f"{printable(row['flight']):<7} {printable(row['passenger'])}  "
+        f"agent={printable(row['agent'] or '-')}  "
+        f"deadline={row['deadline']}  note={printable(row['note'] or '-')}"
     )
 
 
@@ -125,12 +133,13 @@ def cmd_history(conn, args, now):
     for row in claims.get_history(conn, args.id):
         print(
             f"{row['changed_at']}  {row['old_status'] or '-':<9} -> "
-            f"{row['new_status']:<9} by {row['changed_by']}"
+            f"{row['new_status']:<9} by {printable(row['changed_by'])}"
         )
 
 
 def cmd_seed(conn, args, now):
-    with open(args.csv_path, newline="", encoding="utf-8") as f:
+    # utf-8-sig also accepts the byte-order mark that Excel adds to "CSV UTF-8" files.
+    with open(args.csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         missing = [c for c in SEED_COLUMNS if c not in (reader.fieldnames or [])]
         if missing:
@@ -139,10 +148,11 @@ def cmd_seed(conn, args, now):
             )
         count = 0
         for line_no, row in enumerate(reader, start=2):  # line 1 is the header
+            values = {column: (row[column] or "").strip() for column in SEED_COLUMNS}
             try:
                 claims.file_claim(
-                    conn, row["passenger"], row["flight"], row["type"], row["tier"],
-                    now, note=row["note"] or None,
+                    conn, values["passenger"], values["flight"], values["type"], values["tier"],
+                    now, note=values["note"] or None,
                 )
             except claims.ClaimError as exc:
                 raise claims.ClaimError(
@@ -168,18 +178,13 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     now = args.now or datetime.now(UTC)  # the only place the real clock is read
 
-    conn = db.connect(args.db)
     try:
-        db.create_tables(conn)
-        COMMANDS[args.command](conn, args, now)
-    except claims.ClaimError as exc:
+        with contextlib.closing(db.connect(args.db)) as conn:
+            db.create_tables(conn)
+            COMMANDS[args.command](conn, args, now)
+    except (claims.ClaimError, OSError, UnicodeDecodeError, csv.Error, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    except OSError as exc:  # e.g. seed file not found
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        conn.close()
     return 0
 
 
